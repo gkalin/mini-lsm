@@ -30,9 +30,10 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -241,7 +242,13 @@ impl MiniLsm {
         self.inner.force_full_compaction()
     }
 }
-
+pub(crate) fn convert_bound<T: AsRef<[u8]>>(bound: Bound<T>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b.as_ref())),
+        Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b.as_ref())),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
 impl LsmStorageInner {
     pub(crate) fn next_sst_id(&self) -> usize {
         self.next_sst_id
@@ -396,6 +403,22 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        // Assume MemtableIterator is the concrete iterator type
+        let snapshot = {
+            let lock_guard = self.state.read();
+            Arc::clone(&lock_guard)
+        };
+        let iters = std::iter::once(Box::new(snapshot.memtable.scan(_lower, _upper)))
+            .chain(
+                snapshot
+                    .imm_memtables
+                    .iter()
+                    .map(|memtable| Box::new(memtable.scan(_lower, _upper))),
+            )
+            .collect();
+        Ok(FusedIterator::new(LsmIterator::new(
+            MergeIterator::create(iters),
+            convert_bound(_upper),
+        )?))
     }
 }
