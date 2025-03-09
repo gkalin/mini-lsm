@@ -29,28 +29,74 @@ pub struct BlockBuilder {
     block_size: usize,
     /// The first key in the block
     first_key: KeyVec,
+    size: usize,
+    full: bool,
 }
 
 impl BlockBuilder {
     /// Creates a new block builder.
     pub fn new(block_size: usize) -> Self {
-        unimplemented!()
+        Self {
+            offsets: Vec::new(),
+            data: Vec::new(),
+            block_size,
+            first_key: KeyVec::new(),
+            full: false,
+            size: 2,
+        }
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        unimplemented!()
+        let key_size = key.len();
+        let value_size = value.len();
+        let entry_size = 2 + key_size + 2 + value_size + 2;
+        println!("entry_size: {}, key {:?}", entry_size, key.raw_ref());
+        if self.full {
+            return false;
+        }
+        if self.block_size < self.size + entry_size {
+            self.full = true;
+            if self.first_key.is_empty() {
+                self.first_key = key.to_key_vec();
+                self.data.push((key_size >> 8) as u8);
+                self.data.push((key_size & 0xff) as u8);
+                self.data.extend_from_slice(key.raw_ref());
+                self.data.push((value_size >> 8) as u8);
+                self.data.push((value_size & 0xff) as u8);
+                self.data.extend_from_slice(value);
+                self.offsets.push(0);
+                self.size += entry_size;
+                return true;
+            }
+            return false;
+        }
+        self.size += entry_size;
+        self.offsets.push(self.data.len() as u16);
+        self.data.push((key_size >> 8) as u8);
+        self.data.push((key_size & 0xff) as u8);
+        self.data.extend_from_slice(key.raw_ref());
+        self.data.push((value_size >> 8) as u8);
+        self.data.push((value_size & 0xff) as u8);
+        self.data.extend_from_slice(value);
+        if self.first_key.is_empty() {
+            self.first_key = key.to_key_vec();
+        }
+        true
     }
 
     /// Check if there is no key-value pair in the block.
     pub fn is_empty(&self) -> bool {
-        unimplemented!()
+        self.first_key.is_empty()
     }
 
     /// Finalize the block.
     pub fn build(self) -> Block {
-        unimplemented!()
+        Block {
+            data: self.data,
+            offsets: self.offsets,
+        }
     }
 }
