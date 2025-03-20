@@ -53,7 +53,6 @@ impl BlockBuilder {
         let key_size = key.len();
         let value_size = value.len();
         let entry_size = 2 + key_size + 2 + value_size + 2;
-        println!("entry_size: {}, key {:?}", entry_size, key.raw_ref());
         if self.full {
             return false;
         }

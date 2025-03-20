@@ -53,12 +53,51 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
-        unimplemented!()
+        buf.extend_from_slice(&block_meta.len().to_ne_bytes());
+        for meta in block_meta {
+            buf.extend_from_slice(&meta.offset.to_ne_bytes());
+            buf.extend_from_slice(&meta.first_key.len().to_ne_bytes());
+            buf.extend_from_slice(&meta.first_key.raw_ref());
+            buf.extend_from_slice(&meta.last_key.len().to_ne_bytes());
+            buf.extend_from_slice(&meta.last_key.raw_ref());
+        }
     }
 
     /// Decode block meta from a buffer.
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        unimplemented!()
+        let mut block_meta_buf = [0u8; std::mem::size_of::<usize>()];
+        buf.chunk().copy_to_slice(&mut block_meta_buf);
+        let block_meta_len = usize::from_ne_bytes(block_meta_buf);
+
+        let mut block_meta = Vec::with_capacity(block_meta_len);
+
+        for _ in 0..block_meta_len {
+            let mut offset_buf = [0u8; std::mem::size_of::<usize>()];
+            buf.copy_to_slice(&mut offset_buf);
+            let offset = usize::from_ne_bytes(offset_buf);
+
+            let mut first_key_len_buf = [0u8; std::mem::size_of::<usize>()];
+            buf.copy_to_slice(&mut first_key_len_buf);
+            let first_key_len = usize::from_ne_bytes(first_key_len_buf);
+
+            let mut first_key = vec![0; first_key_len];
+            buf.copy_to_slice(&mut first_key);
+
+            let mut last_key_len_buf = [0u8; std::mem::size_of::<usize>()];
+            buf.copy_to_slice(&mut last_key_len_buf);
+            let last_key_len = usize::from_ne_bytes(last_key_len_buf);
+
+            let mut last_key = vec![0; last_key_len];
+            buf.copy_to_slice(&mut last_key);
+
+            block_meta.push(BlockMeta {
+                offset,
+                first_key: KeyBytes::from_bytes(first_key.into()),
+                last_key: KeyBytes::from_bytes(last_key.into()),
+            });
+        }
+
+        block_meta
     }
 }
 
