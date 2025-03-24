@@ -75,9 +75,9 @@ impl SsTableBuilder {
                 last_key: KeyBytes::from_bytes(key.raw_ref().to_vec().into()),
             });
         }
+        self.last_key = key.raw_ref().to_vec();
         self.meta.last_mut().unwrap().last_key = KeyBytes::from_bytes(self.last_key.clone().into());
         let _ = self.builder.add(key, value);
-        self.last_key = key.raw_ref().to_vec();
     }
 
     /// Get the estimated size of the SSTable.
@@ -95,9 +95,14 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        let block = self.builder.build();
         let meta_block_offset = self.data.len();
-        let file = FileObject::create(path.as_ref(), self.data)?;
+        let mut disk_data = Vec::new();
+        disk_data.extend(self.data);
+        BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
+        disk_data.extend((meta_block_offset as u64).to_le_bytes());
+
+        let block = self.builder.build();
+        let file = FileObject::create(path.as_ref(), disk_data)?;
         let sstable = SsTable {
             file,
             block_meta: self.meta,

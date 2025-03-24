@@ -53,40 +53,35 @@ impl BlockMeta {
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
     ) {
-        buf.extend_from_slice(&block_meta.len().to_ne_bytes());
+        let block_meta_len = block_meta.len() as u64;
+        buf.extend_from_slice(&block_meta_len.to_le_bytes());
         for meta in block_meta {
-            buf.extend_from_slice(&meta.offset.to_ne_bytes());
-            buf.extend_from_slice(&meta.first_key.len().to_ne_bytes());
+            let offset = meta.offset as u64;
+            buf.extend_from_slice(&offset.to_le_bytes());
+            let first_key_len = meta.first_key.len() as u64;
+            let last_key_len = meta.last_key.len() as u64;
+            buf.extend_from_slice(&first_key_len.to_le_bytes());
             buf.extend_from_slice(&meta.first_key.raw_ref());
-            buf.extend_from_slice(&meta.last_key.len().to_ne_bytes());
+            buf.extend_from_slice(&last_key_len.to_le_bytes());
             buf.extend_from_slice(&meta.last_key.raw_ref());
         }
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
-        let mut block_meta_buf = [0u8; std::mem::size_of::<usize>()];
-        buf.chunk().copy_to_slice(&mut block_meta_buf);
-        let block_meta_len = usize::from_ne_bytes(block_meta_buf);
+    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+        let block_meta_len = buf.get_u64_le() as usize;
 
         let mut block_meta = Vec::with_capacity(block_meta_len);
 
         for _ in 0..block_meta_len {
-            let mut offset_buf = [0u8; std::mem::size_of::<usize>()];
-            buf.copy_to_slice(&mut offset_buf);
-            let offset = usize::from_ne_bytes(offset_buf);
+            let offset = buf.get_u64_le() as usize;
 
-            let mut first_key_len_buf = [0u8; std::mem::size_of::<usize>()];
-            buf.copy_to_slice(&mut first_key_len_buf);
-            let first_key_len = usize::from_ne_bytes(first_key_len_buf);
+            let first_key_len = buf.get_u64_le() as usize;
 
             let mut first_key = vec![0; first_key_len];
             buf.copy_to_slice(&mut first_key);
 
-            let mut last_key_len_buf = [0u8; std::mem::size_of::<usize>()];
-            buf.copy_to_slice(&mut last_key_len_buf);
-            let last_key_len = usize::from_ne_bytes(last_key_len_buf);
-
+            let last_key_len = buf.get_u64_le() as usize;
             let mut last_key = vec![0; last_key_len];
             buf.copy_to_slice(&mut last_key);
 
@@ -161,7 +156,28 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
-        unimplemented!()
+        let file_block_meta_offset = file.read(file.size() - 8, 8)?;
+        let block_meta_offset = u64::from_le_bytes(
+            file_block_meta_offset
+                .as_slice()
+                .try_into()
+                .expect("failed to convert file block meta offset"),
+        );
+        let block_meta_file = file.read(block_meta_offset, file.size() - 8 - block_meta_offset)?;
+        let block_meta = BlockMeta::decode_block_meta(block_meta_file.as_slice());
+        let first_key = block_meta.first().unwrap().first_key.clone();
+        let last_key = block_meta.last().unwrap().last_key.clone();
+        Ok(Self {
+            file,
+            block_meta,
+            block_meta_offset: block_meta_offset as usize,
+            id,
+            block_cache,
+            first_key,
+            last_key,
+            bloom: None,
+            max_ts: 0,
+        })
     }
 
     /// Create a mock SST with only first key + last key metadata
@@ -186,7 +202,19 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        let meta = &self.block_meta[block_idx];
+        println!("Reading block at offset {}", meta.offset);
+        let curr_offset = meta.offset as u64;
+        let next_offset = if block_idx + 1 < self.block_meta.len() {
+            self.block_meta[block_idx + 1].offset as u64
+        } else {
+            self.block_meta_offset as u64
+        };
+        let data = self.file.read(curr_offset, next_offset - curr_offset)?;
+        let decoded = Block::decode(data.as_ref());
+        let encoded = decoded.encode();
+        assert_eq!(data.as_slice(), encoded.to_vec().as_slice());
+        Ok(Arc::new(decoded))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -198,7 +226,18 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        unimplemented!()
+        let idx = self
+            .block_meta
+            .binary_search_by(|meta| match meta.first_key.as_key_slice().cmp(&key) {
+                std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
+                order => order,
+            })
+            .unwrap_err();
+        if idx == self.block_meta.len() || self.block_meta[idx].first_key.as_key_slice() == key {
+            idx
+        } else {
+            idx.saturating_sub(1)
+        }
     }
 
     /// Get number of data blocks.
