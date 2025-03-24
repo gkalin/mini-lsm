@@ -17,7 +17,7 @@
 
 use std::{
     cmp::{self},
-    collections::{binary_heap::PeekMut, BinaryHeap},
+    collections::{BinaryHeap, binary_heap::PeekMut},
 };
 
 use anyhow::Result;

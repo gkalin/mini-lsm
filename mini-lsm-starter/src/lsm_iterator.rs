@@ -18,7 +18,7 @@
 use bytes::Bytes;
 use std::ops::Bound;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::{
     iterators::{StorageIterator, merge_iterator::MergeIterator},
