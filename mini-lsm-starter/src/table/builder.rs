@@ -54,30 +54,28 @@ impl SsTableBuilder {
     ///
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
+    pub fn finalize(&mut self) {
+        let old_builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
+        let old_block = old_builder.build().encode();
+        self.meta.push(BlockMeta {
+            offset: self.data.len(),
+            first_key: KeyBytes::from_bytes(std::mem::take(&mut self.first_key).into()),
+            last_key: KeyBytes::from_bytes(std::mem::take(&mut self.last_key).into()),
+        });
+        self.data.extend(old_block);
+    }
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
-            self.meta.push(BlockMeta {
-                offset: 0,
-                first_key: KeyBytes::from_bytes(self.first_key.clone().into()),
-                last_key: KeyBytes::from_bytes(self.first_key.clone().into()),
-            });
         }
-        if !self.builder.add(key, value) {
-            // done with current block
-            let new_builder = BlockBuilder::new(self.block_size);
-            let old_builder = std::mem::replace(&mut self.builder, new_builder);
-            let old_block = old_builder.build();
-            self.data.extend(old_block.encode());
-            self.meta.push(BlockMeta {
-                offset: self.data.len(),
-                first_key: KeyBytes::from_bytes(key.raw_ref().to_vec().into()),
-                last_key: KeyBytes::from_bytes(key.raw_ref().to_vec().into()),
-            });
+        if self.builder.add(key, value) {
+            self.last_key = key.raw_ref().to_vec();
+            return;
         }
+        self.finalize();
+        assert!(self.builder.add(key, value));
         self.last_key = key.raw_ref().to_vec();
-        self.meta.last_mut().unwrap().last_key = KeyBytes::from_bytes(self.last_key.clone().into());
-        let _ = self.builder.add(key, value);
+        self.first_key = key.raw_ref().to_vec();
     }
 
     /// Get the estimated size of the SSTable.
@@ -95,9 +93,9 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
-        let meta_block_offset = self.data.len();
-        let mut disk_data = Vec::new();
-        disk_data.extend(self.data);
+        self.finalize();
+        let mut disk_data = self.data;
+        let meta_block_offset = disk_data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
         disk_data.extend((meta_block_offset as u64).to_le_bytes());
 
@@ -105,12 +103,12 @@ impl SsTableBuilder {
         let file = FileObject::create(path.as_ref(), disk_data)?;
         let sstable = SsTable {
             file,
-            block_meta: self.meta,
             block_meta_offset: meta_block_offset,
             id,
             block_cache,
-            first_key: KeyBytes::from_bytes(self.first_key.into()),
-            last_key: KeyBytes::from_bytes(self.last_key.into()),
+            first_key: self.meta.first().unwrap().first_key.clone(),
+            last_key: self.meta.last().unwrap().last_key.clone(),
+            block_meta: self.meta,
             bloom: None,
             max_ts: 0,
         };
