@@ -61,9 +61,9 @@ impl BlockMeta {
             let first_key_len = meta.first_key.len() as u64;
             let last_key_len = meta.last_key.len() as u64;
             buf.extend_from_slice(&first_key_len.to_le_bytes());
-            buf.extend_from_slice(&meta.first_key.raw_ref());
+            buf.extend_from_slice(meta.first_key.raw_ref());
             buf.extend_from_slice(&last_key_len.to_le_bytes());
-            buf.extend_from_slice(&meta.last_key.raw_ref());
+            buf.extend_from_slice(meta.last_key.raw_ref());
         }
     }
 
@@ -202,19 +202,14 @@ impl SsTable {
 
     /// Read a block from the disk.
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
-        let meta = &self.block_meta[block_idx];
-        println!("Reading block at offset {}", meta.offset);
-        let curr_offset = meta.offset as u64;
+        let curr_offset = self.block_meta[block_idx].offset as u64;
         let next_offset = if block_idx + 1 < self.block_meta.len() {
             self.block_meta[block_idx + 1].offset as u64
         } else {
             self.block_meta_offset as u64
         };
         let data = self.file.read(curr_offset, next_offset - curr_offset)?;
-        let decoded = Block::decode(data.as_ref());
-        let encoded = decoded.encode();
-        assert_eq!(data.as_slice(), encoded.to_vec().as_slice());
-        Ok(Arc::new(decoded))
+        Ok(Arc::new(Block::decode(data.as_ref())))
     }
 
     /// Read a block from disk, with block cache. (Day 4)
@@ -226,18 +221,10 @@ impl SsTable {
     /// Note: You may want to make use of the `first_key` stored in `BlockMeta`.
     /// You may also assume the key-value pairs stored in each consecutive block are sorted.
     pub fn find_block_idx(&self, key: KeySlice) -> usize {
-        let idx = self
-            .block_meta
-            .binary_search_by(|meta| match meta.first_key.as_key_slice().cmp(&key) {
-                std::cmp::Ordering::Equal => std::cmp::Ordering::Greater,
-                order => order,
-            })
-            .unwrap_err();
-        if idx == self.block_meta.len() || self.block_meta[idx].first_key.as_key_slice() == key {
-            idx
-        } else {
-            idx.saturating_sub(1)
-        }
+        // partition point > key
+        self.block_meta
+            .partition_point(|meta| meta.first_key.as_key_slice() <= key)
+            .saturating_sub(1)
     }
 
     /// Get number of data blocks.
