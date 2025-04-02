@@ -98,6 +98,7 @@ impl SsTableBuilder {
         let meta_block_offset = disk_data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
         disk_data.extend((meta_block_offset as u64).to_le_bytes());
+        let cache = block_cache.or_else(|| Some(Arc::new(BlockCache::new(self.meta.len() as u64))));
 
         let block = self.builder.build();
         let file = FileObject::create(path.as_ref(), disk_data)?;
@@ -105,7 +106,7 @@ impl SsTableBuilder {
             file,
             block_meta_offset: meta_block_offset,
             id,
-            block_cache,
+            block_cache: cache,
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             block_meta: self.meta,

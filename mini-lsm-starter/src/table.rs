@@ -167,12 +167,14 @@ impl SsTable {
         let block_meta = BlockMeta::decode_block_meta(block_meta_file.as_slice());
         let first_key = block_meta.first().unwrap().first_key.clone();
         let last_key = block_meta.last().unwrap().last_key.clone();
+        let cache =
+            block_cache.or_else(|| Some(Arc::new(BlockCache::new(block_meta.len() as u64))));
         Ok(Self {
             file,
             block_meta,
             block_meta_offset: block_meta_offset as usize,
             id,
-            block_cache,
+            block_cache: cache,
             first_key,
             last_key,
             bloom: None,
@@ -214,7 +216,11 @@ impl SsTable {
 
     /// Read a block from disk, with block cache. (Day 4)
     pub fn read_block_cached(&self, block_idx: usize) -> Result<Arc<Block>> {
-        unimplemented!()
+        self.block_cache
+            .as_deref()
+            .expect("block cache should be initialized")
+            .try_get_with((self.id, block_idx), || self.read_block(block_idx))
+            .map_err(|e| anyhow::anyhow!(e))
     }
 
     /// Find the block that may contain `key`.
