@@ -25,6 +25,15 @@ pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
     // Add fields as need
+    which: Which,
+    done: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Which {
+    First,
+    Second,
+    Default,
 }
 
 impl<
@@ -33,7 +42,66 @@ impl<
 > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let mut default = Self {
+            a,
+            b,
+            which: Which::Default,
+            done: false,
+        };
+        default.choose_next()?;
+        Ok(default)
+    }
+    fn choose_next(&mut self) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        match self.which {
+            Which::First => {
+                self.a.next()?;
+            }
+            Which::Second => {
+                self.b.next()?;
+            }
+            Which::Default => {}
+        }
+        if !self.a.is_valid() && !self.b.is_valid() {
+            self.done = true;
+            return Ok(());
+        } else if !self.a.is_valid() {
+            self.which = Which::Second;
+            return Ok(());
+        } else if !self.b.is_valid() {
+            self.which = Which::First;
+            return Ok(());
+        }
+        let cmp = self.a.key().cmp(&self.b.key());
+        match cmp {
+            std::cmp::Ordering::Less => {
+                self.which = Which::First;
+            }
+            std::cmp::Ordering::Greater => {
+                self.which = Which::Second;
+            }
+            std::cmp::Ordering::Equal => {
+                self.which = Which::First;
+            }
+        }
+        match self.which {
+            Which::First => {
+                while self.b.is_valid() && self.a.key() == self.b.key() {
+                    self.b.next()?;
+                }
+            }
+            Which::Second => {
+                while self.a.is_valid() && self.a.key() == self.b.key() {
+                    self.a.next()?;
+                }
+            }
+            Which::Default => {
+                unreachable!();
+            }
+        }
+        Ok(())
     }
 }
 
@@ -45,18 +113,26 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        match self.which {
+            Which::First => self.a.key(),
+            Which::Second => self.b.key(),
+            Which::Default => unreachable!(),
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        match self.which {
+            Which::First => self.a.value(),
+            Which::Second => self.b.value(),
+            Which::Default => unreachable!(),
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.done
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.choose_next()
     }
 }
