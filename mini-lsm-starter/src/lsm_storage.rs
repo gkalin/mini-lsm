@@ -30,12 +30,15 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::{Key, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -305,16 +308,19 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let state = self.state.read();
+        let snapshot = {
+            let lock_guard = self.state.read();
+            Arc::clone(&lock_guard)
+        };
         // check current memtable
-        if let Some(slice) = state.memtable.get(_key) {
+        if let Some(slice) = snapshot.memtable.get(_key) {
             if slice.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(slice));
         }
         // check immutable memtables from latest to earliest
-        for imm_memtable in state.imm_memtables.iter() {
+        for imm_memtable in snapshot.imm_memtables.iter() {
             if let Some(slice) = imm_memtable.get(_key) {
                 if slice.is_empty() {
                     return Ok(None);
@@ -322,6 +328,20 @@ impl LsmStorageInner {
                 return Ok(Some(slice));
             }
         }
+        let mut sstable_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for id in snapshot.l0_sstables.iter() {
+            let sstable = snapshot.sstables[id].clone();
+            let iter =
+                SsTableIterator::create_and_seek_to_key(sstable, KeySlice::from_slice(_key))?;
+            if iter.is_valid() {
+                sstable_iters.push(Box::new(iter));
+            }
+        }
+        let iters = MergeIterator::create(sstable_iters);
+        if iters.is_valid() && iters.key().raw_ref() == _key && !iters.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(iters.value())));
+        }
+
         Ok(None)
     }
 
@@ -416,9 +436,66 @@ impl LsmStorageInner {
                     .map(|memtable| Box::new(memtable.scan(_lower, _upper))),
             )
             .collect();
+        let mut sstable_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for id in snapshot.l0_sstables.iter() {
+            let sstable = snapshot.sstables[id].clone();
+            if overlap(
+                _lower,
+                _upper,
+                sstable.first_key().as_key_slice(),
+                sstable.last_key().as_key_slice(),
+            ) {
+                let iter = match _lower {
+                    Bound::Included(key) => {
+                        SsTableIterator::create_and_seek_to_key(sstable, KeySlice::from_slice(key))?
+                    }
+                    Bound::Excluded(key) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            sstable,
+                            KeySlice::from_slice(key),
+                        )?;
+                        if iter.is_valid() && iter.key().raw_ref() == key {
+                            iter.next()?;
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(sstable)?,
+                };
+                sstable_iters.push(Box::new(iter));
+            }
+        }
+        let merge_sstable_iters = MergeIterator::create(sstable_iters);
+        let merge_iters = MergeIterator::create(iters);
         Ok(FusedIterator::new(LsmIterator::new(
-            MergeIterator::create(iters),
+            TwoMergeIterator::create(merge_iters, merge_sstable_iters)?,
             convert_bound(_upper),
         )?))
     }
+}
+
+fn overlap(
+    user_begin: Bound<&[u8]>,
+    user_end: Bound<&[u8]>,
+    table_begin: KeySlice,
+    table_end: KeySlice,
+) -> bool {
+    match user_end {
+        Bound::Excluded(key) if key <= table_begin.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key < table_begin.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    match user_begin {
+        Bound::Excluded(key) if key >= table_end.raw_ref() => {
+            return false;
+        }
+        Bound::Included(key) if key > table_end.raw_ref() => {
+            return false;
+        }
+        _ => {}
+    }
+    true
 }

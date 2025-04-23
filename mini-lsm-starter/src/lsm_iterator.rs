@@ -21,16 +21,21 @@ use std::ops::Bound;
 use anyhow::{Result, bail};
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper_bound: Bound<Bytes>,
+    done: bool,
 }
 
 impl LsmIterator {
@@ -47,6 +52,7 @@ impl LsmIterator {
         Ok(Self {
             inner: iter,
             upper_bound,
+            done: false,
         })
     }
 }
@@ -55,7 +61,7 @@ impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
     fn is_valid(&self) -> bool {
-        self.inner.is_valid()
+        !self.done && self.inner.is_valid()
     }
 
     fn key(&self) -> &[u8] {
@@ -63,19 +69,17 @@ impl StorageIterator for LsmIterator {
     }
 
     fn value(&self) -> &[u8] {
-        let text = std::str::from_utf8(self.inner.key().raw_ref()).unwrap();
-        print!("key {} b'", text);
-        for &b in self.inner.value() {
-            print!("{}'", b as char);
-        }
-        println!();
         self.inner.value()
     }
 
     fn next(&mut self) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
         loop {
             self.inner.next()?;
             if !self.inner.is_valid() {
+                self.done = true;
                 break;
             }
             if self.inner.value().is_empty() {
@@ -87,11 +91,13 @@ impl StorageIterator for LsmIterator {
             match self.upper_bound.as_ref() {
                 Bound::Excluded(bound) => {
                     if self.inner.key().raw_ref() >= bound.as_ref() {
+                        self.done = true;
                         break;
                     }
                 }
                 Bound::Included(bound) => {
                     if self.inner.key().raw_ref() > bound.as_ref() {
+                        self.done = true;
                         break;
                     }
                 }
