@@ -135,4 +135,7 @@ impl<
     fn next(&mut self) -> Result<()> {
         self.choose_next()
     }
+    fn num_active_iterators(&self) -> usize {
+        self.a.num_active_iterators() + self.b.num_active_iterators()
+    }
 }

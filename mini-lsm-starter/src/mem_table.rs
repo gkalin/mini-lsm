@@ -15,6 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::fmt;
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
-use crate::table::SsTableBuilder;
+use crate::table::{SsTable, SsTableBuilder};
 use crate::wal::Wal;
 use crossbeam_skiplist::map::Entry;
 
@@ -138,7 +139,10 @@ impl MemTable {
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
     pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+        for entry in self.map.iter() {
+            _builder.add(KeySlice::from_slice(entry.key()), entry.value());
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {
