@@ -326,6 +326,10 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
+    fn key_within(key: &[u8], begin: KeySlice, end: KeySlice) -> bool {
+        begin.raw_ref() <= key && key <= end.raw_ref()
+    }
+
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
         let snapshot = {
@@ -351,6 +355,13 @@ impl LsmStorageInner {
         let mut sstable_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for id in snapshot.l0_sstables.iter() {
             let sstable = snapshot.sstables[id].clone();
+            if !Self::key_within(
+                _key,
+                sstable.first_key().as_key_slice(),
+                sstable.last_key().as_key_slice(),
+            ) {
+                continue;
+            }
             let iter =
                 SsTableIterator::create_and_seek_to_key(sstable, KeySlice::from_slice(_key))?;
             if iter.is_valid() {
