@@ -16,6 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -173,7 +174,21 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).ok();
+        if let Some(handle) = self.flush_thread.lock().take() {
+            handle.join().expect("Failed to join flush thread");
+        }
+        self.compaction_notifier.send(()).ok();
+        if let Some(handle) = self.compaction_thread.lock().take() {
+            handle.join().expect("Failed to join compaction thread");
+        }
+        while {
+            let snapshot = self.inner.state.read();
+            !snapshot.imm_memtables.is_empty()
+        } {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -266,6 +281,11 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
+        if path.exists() && !path.is_dir() {
+            return Err(anyhow::anyhow!("{} is not a directory", path.display()));
+        } else if !path.exists() {
+            std::fs::create_dir_all(path)?;
+        }
         let state = LsmStorageState::create(&options);
 
         let compaction_controller = match &options.compaction_options {
@@ -383,7 +403,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     pub fn try_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
@@ -409,7 +430,34 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        let to_flush = {
+            let lock_guard = self.state.read();
+            let Some(to_flush) = lock_guard.imm_memtables.last() else {
+                println!("No imm memtable to flush");
+                return Err(anyhow::anyhow!("No imm memtable to flush"));
+            };
+            to_flush.clone()
+        };
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        to_flush.flush(&mut sst_builder)?;
+        let sst_id = to_flush.id();
+        let sst = sst_builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+        {
+            let mut guard = self.state.write();
+            let new_state = Arc::make_mut(&mut guard);
+            let prev_table = new_state.imm_memtables.pop().unwrap();
+            assert_eq!(prev_table.id(), sst_id);
+            new_state.l0_sstables.insert(0, sst_id);
+            new_state.sstables.insert(sst_id, Arc::new(sst));
+        };
+        println!("Flushed memtable {}", sst_id);
+        self.sync_dir()?;
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
