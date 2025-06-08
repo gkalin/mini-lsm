@@ -88,6 +88,14 @@ impl Key<Vec<u8>> {
     pub fn for_testing_from_vec_no_ts(key: Vec<u8>) -> Self {
         Self(key)
     }
+    pub fn prefix_decode(&self, prefix: KeySlice) -> KeyVec {
+        let key_overlap_len = u16::from_le_bytes(self.0[0..2].try_into().unwrap());
+        let rest_key_len = u16::from_le_bytes(self.0[2..4].try_into().unwrap());
+        let rest_key = &self.0[4..4 + rest_key_len as usize];
+        let mut key = prefix.0[0..key_overlap_len as usize].to_vec();
+        key.extend_from_slice(rest_key);
+        Key::from_vec(key)
+    }
 }
 
 impl Key<Bytes> {
@@ -139,6 +147,16 @@ impl<'a> Key<&'a [u8]> {
 
     pub fn for_testing_from_slice_with_ts(slice: &'a [u8], _ts: u64) -> Self {
         Self(slice)
+    }
+    
+    pub fn prefix_encode(&self, prefix: KeySlice) -> KeyVec {
+        let key_overlap_len: u16 = self.0.iter().zip(prefix.0.iter()).take_while(|(a, b)| a == b).count() as u16;
+        let rest_key_len: u16 = self.0.len() as u16 - key_overlap_len;
+        let mut rest_key = Vec::with_capacity(rest_key_len as usize);
+        rest_key.extend_from_slice(&key_overlap_len.to_le_bytes());
+        rest_key.extend_from_slice(&rest_key_len.to_le_bytes());
+        rest_key.extend_from_slice(&self.0[key_overlap_len as usize..]);
+        Key::from_vec(rest_key)
     }
 }
 
