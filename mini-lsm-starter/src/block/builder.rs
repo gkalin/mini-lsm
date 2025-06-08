@@ -74,15 +74,19 @@ impl BlockBuilder {
         }
         self.size += entry_size;
         self.offsets.push(self.data.len() as u16);
-        self.data.push((key_size >> 8) as u8);
-        self.data.push((key_size & 0xff) as u8);
-        self.data.extend_from_slice(key.raw_ref());
+        if self.first_key.is_empty() {
+            self.first_key = key.to_key_vec();
+            self.data.push((key_size >> 8) as u8);
+            self.data.push((key_size & 0xff) as u8);
+            self.data.extend_from_slice(key.raw_ref());
+        } else {
+            let encoded_key = key.prefix_encode(self.first_key.as_key_slice());
+            self.data.extend_from_slice(encoded_key.raw_ref());
+        }
         self.data.push((value_size >> 8) as u8);
         self.data.push((value_size & 0xff) as u8);
         self.data.extend_from_slice(value);
-        if self.first_key.is_empty() {
-            self.first_key = key.to_key_vec();
-        }
+        
         true
     }
 

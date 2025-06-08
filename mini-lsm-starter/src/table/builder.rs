@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use super::{BlockMeta, FileObject, SsTable};
+use super::{BlockMeta, FileObject, SsTable, bloom::Bloom};
 use crate::{
     block::BlockBuilder,
     key::{KeyBytes, KeySlice},
@@ -35,6 +35,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hashes: Vec<u32>,
 }
 
 impl SsTableBuilder {
@@ -47,6 +48,7 @@ impl SsTableBuilder {
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
+            key_hashes: Vec::new(),
         }
     }
 
@@ -76,6 +78,7 @@ impl SsTableBuilder {
         assert!(self.builder.add(key, value));
         self.last_key = key.raw_ref().to_vec();
         self.first_key = key.raw_ref().to_vec();
+        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
     }
 
     /// Get the estimated size of the SSTable.
@@ -97,7 +100,11 @@ impl SsTableBuilder {
         let mut disk_data = self.data;
         let meta_block_offset = disk_data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
+        let meta_len = disk_data.len() - meta_block_offset;
+        let bloom = Bloom::build_from_key_hashes(&self.key_hashes, 20);
+        disk_data.extend((self.meta.len() as u64).to_le_bytes());
         disk_data.extend((meta_block_offset as u64).to_le_bytes());
+
         let cache = block_cache.or_else(|| Some(Arc::new(BlockCache::new(self.meta.len() as u64))));
 
         let block = self.builder.build();
