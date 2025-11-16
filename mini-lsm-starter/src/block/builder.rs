@@ -52,7 +52,7 @@ impl BlockBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         let key_size = key.len();
         let value_size = value.len();
-        let entry_size = 2 + key_size + 2 + value_size + 2;
+        let mut entry_size = 2 + key_size + 2 + value_size + 2;
         if self.full {
             return false;
         }
@@ -72,7 +72,6 @@ impl BlockBuilder {
             }
             return false;
         }
-        self.size += entry_size;
         self.offsets.push(self.data.len() as u16);
         if self.first_key.is_empty() {
             self.first_key = key.to_key_vec();
@@ -82,11 +81,14 @@ impl BlockBuilder {
         } else {
             let encoded_key = key.prefix_encode(self.first_key.as_key_slice());
             self.data.extend_from_slice(encoded_key.raw_ref());
+            entry_size -= 2 + key_size;
+            entry_size += encoded_key.len();
         }
+        self.size += entry_size;
         self.data.push((value_size >> 8) as u8);
         self.data.push((value_size & 0xff) as u8);
         self.data.extend_from_slice(value);
-        
+
         true
     }
 

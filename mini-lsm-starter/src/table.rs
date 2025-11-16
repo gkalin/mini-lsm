@@ -156,6 +156,7 @@ impl SsTable {
 
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+        // Read block metadata offset (last 8 bytes)
         let file_block_meta_offset = file.read(file.size() - 8, 8)?;
         let block_meta_offset = u64::from_le_bytes(
             file_block_meta_offset
@@ -163,8 +164,24 @@ impl SsTable {
                 .try_into()
                 .expect("failed to convert file block meta offset"),
         );
-        let block_meta_file = file.read(block_meta_offset, file.size() - 8 - block_meta_offset)?;
+
+        // Read bloom filter offset (8 bytes before block metadata offset)
+        let file_bloom_offset = file.read(file.size() - 16, 8)?;
+        let bloom_offset = u64::from_le_bytes(
+            file_bloom_offset
+                .as_slice()
+                .try_into()
+                .expect("failed to convert bloom offset"),
+        );
+
+        // Read block metadata
+        let block_meta_file = file.read(block_meta_offset, bloom_offset - block_meta_offset)?;
         let block_meta = BlockMeta::decode_block_meta(block_meta_file.as_slice());
+
+        // Read bloom filter
+        let bloom_data = file.read(bloom_offset, file.size() - 16 - bloom_offset)?;
+        let bloom = Bloom::decode(bloom_data.as_ref())?;
+
         let first_key = block_meta.first().unwrap().first_key.clone();
         let last_key = block_meta.last().unwrap().last_key.clone();
         let cache =
@@ -177,7 +194,7 @@ impl SsTable {
             block_cache: cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

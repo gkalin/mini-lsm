@@ -101,8 +101,13 @@ impl SsTableBuilder {
         let meta_block_offset = disk_data.len();
         BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
         let meta_len = disk_data.len() - meta_block_offset;
+
+        // Build and encode bloom filter
         let bloom = Bloom::build_from_key_hashes(&self.key_hashes, 20);
-        disk_data.extend((self.meta.len() as u64).to_le_bytes());
+        let bloom_offset = disk_data.len();
+        bloom.encode(&mut disk_data);
+
+        disk_data.extend((bloom_offset as u64).to_le_bytes());
         disk_data.extend((meta_block_offset as u64).to_le_bytes());
 
         let cache = block_cache.or_else(|| Some(Arc::new(BlockCache::new(self.meta.len() as u64))));
@@ -117,7 +122,7 @@ impl SsTableBuilder {
             first_key: self.meta.first().unwrap().first_key.clone(),
             last_key: self.meta.last().unwrap().last_key.clone(),
             block_meta: self.meta,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         };
         Ok(sstable)
