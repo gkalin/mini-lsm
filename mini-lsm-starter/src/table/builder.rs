@@ -57,6 +57,10 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn finalize(&mut self) {
+        // Don't finalize empty blocks
+        if self.builder.is_empty() {
+            return;
+        }
         let old_builder = std::mem::replace(&mut self.builder, BlockBuilder::new(self.block_size));
         let old_block = old_builder.build().encode();
         self.meta.push(BlockMeta {
@@ -72,6 +76,7 @@ impl SsTableBuilder {
         }
         if self.builder.add(key, value) {
             self.last_key = key.raw_ref().to_vec();
+            self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
             return;
         }
         self.finalize();

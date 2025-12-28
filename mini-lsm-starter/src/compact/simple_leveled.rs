@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::lsm_storage::LsmStorageState;
@@ -23,7 +25,7 @@ pub struct SimpleLeveledCompactionOptions {
     pub max_levels: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SimpleLeveledCompactionTask {
     // if upper_level is `None`, then it is L0 compaction
     pub upper_level: Option<usize>,
@@ -49,7 +51,29 @@ impl SimpleLeveledCompactionController {
         &self,
         _snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        unimplemented!()
+        // L0 trigger
+        let mut task = SimpleLeveledCompactionTask::default();
+        if _snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            task.upper_level_sst_ids = _snapshot.l0_sstables.clone();
+            task.lower_level_sst_ids = _snapshot.levels[0].1.clone();
+            task.lower_level = 0;
+            task.is_lower_level_bottom_level = task.lower_level == _snapshot.levels.len() - 1;
+            return Some(task);
+        }
+        let level_sizes: Vec<usize> = _snapshot.levels.iter().map(|level| level.1.len()).collect();
+        for (lower, window) in level_sizes.windows(2).enumerate() {
+            let (curr, next) = (window[0], window[1]);
+            if next * 100 >= self.options.size_ratio_percent * curr {
+                continue;
+            }
+            task.upper_level = Some(lower);
+            task.lower_level = lower + 1;
+            task.upper_level_sst_ids = _snapshot.levels[lower].1.clone();
+            task.lower_level_sst_ids = _snapshot.levels[task.lower_level].1.clone();
+            task.is_lower_level_bottom_level = task.lower_level == _snapshot.levels.len() - 1;
+            return Some(task);
+        }
+        None
     }
 
     /// Apply the compaction result.
@@ -65,6 +89,27 @@ impl SimpleLeveledCompactionController {
         _task: &SimpleLeveledCompactionTask,
         _output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let to_delete: HashSet<usize> = _task
+            .upper_level_sst_ids
+            .iter()
+            .chain(_task.lower_level_sst_ids.iter())
+            .copied()
+            .collect();
+        let mut new_state = _snapshot.clone();
+        if let Some(upper) = _task.upper_level {
+            new_state.levels[upper]
+                .1
+                .retain(|id| !to_delete.contains(id));
+        } else {
+            new_state.l0_sstables.retain(|id| !to_delete.contains(id));
+        }
+
+        new_state.levels[_task.lower_level]
+            .1
+            .retain(|id| !to_delete.contains(id));
+        new_state.levels[_task.lower_level]
+            .1
+            .extend_from_slice(_output);
+        (new_state, to_delete.into_iter().collect())
     }
 }

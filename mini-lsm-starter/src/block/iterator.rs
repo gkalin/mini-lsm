@@ -169,6 +169,17 @@ impl BlockIterator {
                 offset + 2 + key_len + 2 + value_len,
             );
         } else {
+            // Ensure first_key is initialized before decoding prefix-encoded keys
+            if self.first_key.is_empty() {
+                // Initialize first_key by seeking to index 0
+                let first_offset = self.block.offsets[0] as usize;
+                let first_key_len = ((self.block.data[first_offset] as usize) << 8)
+                    | (self.block.data[first_offset + 1] as usize);
+                self.first_key = KeyVec::from_vec(
+                    self.block.data[first_offset + 2..first_offset + 2 + first_key_len].to_vec(),
+                );
+            }
+
             // Subsequent keys are prefix-encoded
             let key_overlap_len =
                 u16::from_le_bytes([self.block.data[offset], self.block.data[offset + 1]]);

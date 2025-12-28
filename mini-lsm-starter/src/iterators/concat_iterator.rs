@@ -64,6 +64,7 @@ impl SstConcatIterator {
             }
             resp.current = Some(first_iter);
             resp.sstables = sstables;
+            resp.next_sst_idx = i + 1;
             return Ok(resp);
         }
         Ok(Self {
@@ -86,30 +87,33 @@ impl StorageIterator for SstConcatIterator {
     }
 
     fn is_valid(&self) -> bool {
-        if !self.current.as_ref().is_some() {
-            return false;
+        if let Some(ref current) = self.current {
+            current.is_valid()
+        } else {
+            false
         }
-        let curr_valid = self.current.as_ref().unwrap().is_valid();
-        if curr_valid {
-            return curr_valid;
-        }
-        self.sstables.get(self.next_sst_idx).is_some()
     }
 
     fn next(&mut self) -> Result<()> {
-        if !self.is_valid() {
-            return Ok(());
+        // First, advance the current iterator
+        if let Some(ref mut current) = self.current {
+            current.next()?;
+            // If still valid after advancing, we're done
+            if current.is_valid() {
+                return Ok(());
+            }
         }
-        let curr_valid = self.current.as_ref().unwrap().is_valid();
-        if curr_valid {
-            self.current.as_mut().unwrap().next()?;
-            return Ok(());
+
+        // Current iterator is exhausted, try to load next SST
+        if self.next_sst_idx < self.sstables.len() {
+            let next_table = Arc::clone(&self.sstables[self.next_sst_idx]);
+            let iter = SsTableIterator::create_and_seek_to_first(next_table)?;
+            self.next_sst_idx += 1;
+            self.current = Some(iter);
+        } else {
+            // No more SSTs, mark as invalid
+            self.current = None;
         }
-        // curr is not valid
-        let next_table = Arc::clone(&self.sstables[self.next_sst_idx]);
-        let iter = SsTableIterator::create_and_seek_to_first(next_table)?;
-        self.next_sst_idx += 1;
-        self.current = Some(iter);
         Ok(())
     }
 

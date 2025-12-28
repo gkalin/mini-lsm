@@ -31,14 +31,14 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::iterators::{StorageIterator, concat_iterator};
 use crate::key::{Key, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::{MemTable, MemTableIterator};
+use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -370,22 +370,28 @@ impl LsmStorageInner {
             }
         }
         let iters = MergeIterator::create(sstable_iters);
-        if iters.is_valid() && iters.key().raw_ref() == _key && !iters.value().is_empty() {
+        if iters.is_valid() && iters.key().raw_ref() == _key {
+            if iters.value().is_empty() {
+                // Found a tombstone in L0
+                return Ok(None);
+            }
             return Ok(Some(Bytes::copy_from_slice(iters.value())));
         }
-        // Search l1 sstables
-        let l1_sstables = snapshot.levels[0]
-            .1
-            .iter()
-            .flat_map(|idx| snapshot.sstables.get(idx).cloned())
-            .collect();
-        let concat_iterator =
-            SstConcatIterator::create_and_seek_to_key(l1_sstables, Key::from_slice(_key))?;
-        if concat_iterator.is_valid()
-            && concat_iterator.key().raw_ref() == _key
-            && !concat_iterator.value().is_empty()
-        {
-            return Ok(Some(Bytes::copy_from_slice(concat_iterator.value())));
+        // Search l1+ sstables
+        for (_, level) in &snapshot.levels {
+            let sstables = level
+                .iter()
+                .flat_map(|idx| snapshot.sstables.get(idx).cloned())
+                .collect();
+            let concat_iterator =
+                SstConcatIterator::create_and_seek_to_key(sstables, Key::from_slice(_key))?;
+            if concat_iterator.is_valid() && concat_iterator.key().raw_ref() == _key {
+                if concat_iterator.value().is_empty() {
+                    // Found a tombstone
+                    return Ok(None);
+                }
+                return Ok(Some(Bytes::copy_from_slice(concat_iterator.value())));
+            }
         }
 
         Ok(None)
@@ -461,7 +467,7 @@ impl LsmStorageInner {
             let lock_guard = self.state.read();
             let Some(to_flush) = lock_guard.imm_memtables.last() else {
                 println!("No imm memtable to flush");
-                return Err(anyhow::anyhow!("No imm memtable to flush"));
+                return Ok(());
             };
             to_flush.clone()
         };
@@ -540,31 +546,36 @@ impl LsmStorageInner {
         }
         let merge_sstable_iters = MergeIterator::create(sstable_iters);
         let merge_iters = MergeIterator::create(iters);
-        let l1_sstables = snapshot.levels[0]
-            .1
-            .iter()
-            .filter_map(|i| snapshot.sstables.get(i).cloned())
-            .collect();
-        let concat_iterator = match _lower {
-            Bound::Included(key) => {
-                SstConcatIterator::create_and_seek_to_key(l1_sstables, KeySlice::from_slice(key))?
-            }
-            Bound::Excluded(key) => {
-                let mut iter = SstConcatIterator::create_and_seek_to_key(
-                    l1_sstables,
-                    KeySlice::from_slice(key),
-                )?;
-                if iter.is_valid() && iter.key().raw_ref() == key {
-                    iter.next()?;
+
+        let mut concat_iters = Vec::new();
+        for (_, level) in &snapshot.levels {
+            let sstables = level
+                .iter()
+                .filter_map(|j| snapshot.sstables.get(j).cloned())
+                .collect();
+            let concat_iterator = match _lower {
+                Bound::Included(key) => {
+                    SstConcatIterator::create_and_seek_to_key(sstables, KeySlice::from_slice(key))?
                 }
-                iter
-            }
-            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(l1_sstables)?,
-        };
+                Bound::Excluded(key) => {
+                    let mut iter = SstConcatIterator::create_and_seek_to_key(
+                        sstables,
+                        KeySlice::from_slice(key),
+                    )?;
+                    if iter.is_valid() && iter.key().raw_ref() == key {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(sstables)?,
+            };
+            concat_iters.push(Box::new(concat_iterator));
+        }
+        let merge_concat_iters = MergeIterator::create(concat_iters);
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(
                 TwoMergeIterator::create(merge_iters, merge_sstable_iters)?,
-                concat_iterator,
+                merge_concat_iters,
             )?,
             convert_bound(_upper),
         )?))
