@@ -39,6 +39,7 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::{concat_iterator::SstConcatIterator, merge_iterator::MergeIterator};
 use crate::key::KeySlice;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,15 +137,11 @@ impl LsmStorageInner {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
-            } => {
-                return self.full_compaction(l0_sstables, l1_sstables);
-            }
-            CompactionTask::Simple(task) => {
-                return self.simple_compaction(task);
-            }
+            } => return self.full_compaction(l0_sstables, l1_sstables),
+            CompactionTask::Simple(task) => return self.simple_compaction(task),
 
             _ => panic!("should not happen"),
-        }
+        };
     }
     fn simple_compaction(&self, task: &SimpleLeveledCompactionTask) -> Result<Vec<Arc<SsTable>>> {
         let snapshot = {
@@ -281,11 +278,21 @@ impl LsmStorageInner {
                     true
                 }
             });
+            let mut ids = Vec::new();
             for sstable in compacted {
                 let id = sstable.sst_id();
+                ids.push(id);
                 new_state.sstables.insert(id, sstable);
                 new_state.levels[0].1.push(id);
             }
+            self.sync_dir()?;
+            self.manifest
+                .as_ref()
+                .ok_or(anyhow::anyhow!("no manifest"))?
+                .add_record(
+                    &state_lock,
+                    ManifestRecord::Compaction(compaction_task, ids),
+                )?;
         };
         for id in to_delete {
             _ = std::fs::remove_file(self.path_of_sst(id));
@@ -321,6 +328,11 @@ impl LsmStorageInner {
                     new_state.sstables.insert(sstable.sst_id(), sstable);
                 }
                 *current_state = Arc::new(new_state);
+                self.sync_dir()?;
+                self.manifest
+                    .as_ref()
+                    .ok_or(anyhow::anyhow!("no manifest"))?
+                    .add_record(&state_lock, ManifestRecord::Compaction(task, ids))?;
                 to_delete
             };
         for id in to_delete {

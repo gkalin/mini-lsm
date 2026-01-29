@@ -15,13 +15,16 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::fs::File;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::{fs::File, io::Read};
 
 use anyhow::Result;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
+use serde_json::{Deserializer, Value};
 
 use crate::compact::CompactionTask;
 
@@ -38,11 +41,35 @@ pub enum ManifestRecord {
 
 impl Manifest {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        let file = File::options()
+            .create(true)
+            .append(true)
+            .open(_path.as_ref())?;
+        Ok(Manifest {
+            file: Arc::new(Mutex::new(file)),
+        })
     }
 
     pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+        let records = if _path.as_ref().try_exists().unwrap_or(false) {
+            let buffer = fs::read(_path.as_ref())?;
+            if buffer.is_empty() {
+                Vec::new()
+            } else {
+                Deserializer::from_slice(&buffer)
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        } else {
+            Vec::new()
+        };
+        let file = File::options().create(true).append(true).open(_path)?;
+        Ok((
+            Manifest {
+                file: Arc::new(Mutex::new(file)),
+            },
+            records,
+        ))
     }
 
     pub fn add_record(
@@ -54,6 +81,10 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+        let record_json = serde_json::to_vec(&_record)?;
+        let mut file = self.file.lock();
+        file.write_all(&record_json)?;
+        file.sync_all()?;
+        Ok(())
     }
 }
