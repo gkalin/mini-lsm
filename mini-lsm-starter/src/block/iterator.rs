@@ -78,13 +78,7 @@ impl BlockIterator {
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        let key_len = ((self.block.data[0] as usize) << 8) | (self.block.data[1] as usize);
-        self.key = KeyVec::from_vec(self.block.data[2..2 + key_len].to_vec());
-        self.idx = 0;
-        let value_len = ((self.block.data[key_len + 2] as usize) << 8)
-            | (self.block.data[key_len + 3] as usize);
-        self.value_range = (4 + key_len, 4 + key_len + value_len);
-        self.first_key = self.key.clone();
+        self.seek_to_idx(0);
     }
 
     /// Move to the next key in the block.
@@ -94,38 +88,16 @@ impl BlockIterator {
             return;
         }
         self.idx += 1;
-        let offset = self.block.offsets[self.idx] as usize;
-
-        // Decode the prefix-encoded key
-        let key_overlap_len =
-            u16::from_le_bytes([self.block.data[offset], self.block.data[offset + 1]]);
-        let rest_key_len =
-            u16::from_le_bytes([self.block.data[offset + 2], self.block.data[offset + 3]]);
-        let rest_key = &self.block.data[offset + 4..offset + 4 + rest_key_len as usize];
-
-        // Reconstruct the full key from the prefix and rest
-        let mut full_key = self.first_key.raw_ref()[..key_overlap_len as usize].to_vec();
-        full_key.extend_from_slice(rest_key);
-        self.key = KeyVec::from_vec(full_key);
-
-        // Read value length and range
-        let value_offset = offset + 4 + rest_key_len as usize;
-        let value_len = ((self.block.data[value_offset] as usize) << 8)
-            | (self.block.data[value_offset + 1] as usize);
-        self.value_range = (value_offset + 2, value_offset + 2 + value_len);
+        self.seek_to_idx(self.idx);
     }
 
     /// Seek to the first key that >= `key`.
     /// Note: You should assume the key-value pairs in the block are sorted when being added by
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
-        // Ensure first_key is initialized
-        if self.first_key.is_empty() && !self.block.offsets.is_empty() {
-            let offset = self.block.offsets[0] as usize;
-            let key_len =
-                ((self.block.data[offset] as usize) << 8) | (self.block.data[offset + 1] as usize);
-            self.first_key =
-                KeyVec::from_vec(self.block.data[offset + 2..offset + 2 + key_len].to_vec());
+        if self.block.offsets.is_empty() {
+            self.key.clear();
+            return;
         }
 
         let mut left = 0;
@@ -153,48 +125,63 @@ impl BlockIterator {
         self.idx = idx;
         let offset = self.block.offsets[idx] as usize;
 
+        // Format: overlap_len (2) | remaining_key_len (2) | remaining_key | timestamp (8) | value_len (2) | value
+
+        // Read overlap_len
+        let overlap_len =
+            u16::from_be_bytes([self.block.data[offset], self.block.data[offset + 1]]) as usize;
+
+        // Read remaining_key_len
+        let remaining_key_len =
+            u16::from_be_bytes([self.block.data[offset + 2], self.block.data[offset + 3]]) as usize;
+
+        // Read remaining_key
+        let remaining_key = &self.block.data[offset + 4..offset + 4 + remaining_key_len];
+
+        // Read timestamp
+        let ts_bytes: [u8; 8] = self.block.data
+            [offset + 4 + remaining_key_len..offset + 4 + remaining_key_len + 8]
+            .try_into()
+            .unwrap();
+        let timestamp = u64::from_le_bytes(ts_bytes);
+
+        // Reconstruct full key
         if idx == 0 {
-            // First key is stored with length prefix
-            let key_len =
-                ((self.block.data[offset] as usize) << 8) | (self.block.data[offset + 1] as usize);
-            self.key = KeyVec::from_vec(self.block.data[offset + 2..offset + 2 + key_len].to_vec());
-            // Cache the first key if not already set
-            if self.first_key.is_empty() {
-                self.first_key = self.key.clone();
-            }
-            let value_len = ((self.block.data[offset + 2 + key_len] as usize) << 8)
-                | (self.block.data[offset + 2 + key_len + 1] as usize);
-            self.value_range = (
-                offset + 2 + key_len + 2,
-                offset + 2 + key_len + 2 + value_len,
-            );
+            // First key: overlap_len is 0, remaining_key is the full key
+            self.key = KeyVec::from_vec_with_ts(remaining_key.to_vec(), timestamp);
+            self.first_key = self.key.clone();
         } else {
-            // Ensure first_key is initialized before decoding prefix-encoded keys
+            // Ensure first_key is initialized
             if self.first_key.is_empty() {
-                // Initialize first_key by seeking to index 0
+                // Initialize by decoding first key
                 let first_offset = self.block.offsets[0] as usize;
-                let first_key_len = ((self.block.data[first_offset] as usize) << 8)
-                    | (self.block.data[first_offset + 1] as usize);
-                self.first_key = KeyVec::from_vec(
-                    self.block.data[first_offset + 2..first_offset + 2 + first_key_len].to_vec(),
-                );
+                let first_remaining_key_len = u16::from_be_bytes([
+                    self.block.data[first_offset + 2],
+                    self.block.data[first_offset + 3],
+                ]) as usize;
+                let first_remaining_key =
+                    &self.block.data[first_offset + 4..first_offset + 4 + first_remaining_key_len];
+                let first_ts_bytes: [u8; 8] =
+                    self.block.data[first_offset + 4 + first_remaining_key_len
+                        ..first_offset + 4 + first_remaining_key_len + 8]
+                        .try_into()
+                        .unwrap();
+                let first_ts = u64::from_le_bytes(first_ts_bytes);
+                self.first_key = KeyVec::from_vec_with_ts(first_remaining_key.to_vec(), first_ts);
             }
 
-            // Subsequent keys are prefix-encoded
-            let key_overlap_len =
-                u16::from_le_bytes([self.block.data[offset], self.block.data[offset + 1]]);
-            let rest_key_len =
-                u16::from_le_bytes([self.block.data[offset + 2], self.block.data[offset + 3]]);
-            let rest_key = &self.block.data[offset + 4..offset + 4 + rest_key_len as usize];
-
-            let mut full_key = self.first_key.raw_ref()[..key_overlap_len as usize].to_vec();
-            full_key.extend_from_slice(rest_key);
-            self.key = KeyVec::from_vec(full_key);
-
-            let value_offset = offset + 4 + rest_key_len as usize;
-            let value_len = ((self.block.data[value_offset] as usize) << 8)
-                | (self.block.data[value_offset + 1] as usize);
-            self.value_range = (value_offset + 2, value_offset + 2 + value_len);
+            // Build full key from overlap + remaining
+            let mut full_key = self.first_key.key_ref()[..overlap_len].to_vec();
+            full_key.extend_from_slice(remaining_key);
+            self.key = KeyVec::from_vec_with_ts(full_key, timestamp);
         }
+
+        // Read value
+        let value_offset = offset + 4 + remaining_key_len + 8;
+        let value_len = u16::from_be_bytes([
+            self.block.data[value_offset],
+            self.block.data[value_offset + 1],
+        ]) as usize;
+        self.value_range = (value_offset + 2, value_offset + 2 + value_len);
     }
 }

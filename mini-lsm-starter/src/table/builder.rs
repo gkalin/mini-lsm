@@ -30,8 +30,8 @@ use crate::{
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
-    first_key: Vec<u8>,
-    last_key: Vec<u8>,
+    first_key: KeyBytes,
+    last_key: KeyBytes,
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
@@ -43,8 +43,8 @@ impl SsTableBuilder {
     pub fn new(block_size: usize) -> Self {
         Self {
             builder: BlockBuilder::new(block_size),
-            first_key: Vec::new(),
-            last_key: Vec::new(),
+            first_key: KeyBytes::new(),
+            last_key: KeyBytes::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -65,25 +65,25 @@ impl SsTableBuilder {
         let old_block = old_builder.build().encode();
         self.meta.push(BlockMeta {
             offset: self.data.len(),
-            first_key: KeyBytes::from_bytes(std::mem::take(&mut self.first_key).into()),
-            last_key: KeyBytes::from_bytes(std::mem::take(&mut self.last_key).into()),
+            first_key: std::mem::take(&mut self.first_key),
+            last_key: std::mem::take(&mut self.last_key),
         });
         self.data.extend(old_block);
     }
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
         if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
+            self.first_key = key.to_key_vec().into_key_bytes();
         }
         if self.builder.add(key, value) {
-            self.last_key = key.raw_ref().to_vec();
-            self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+            self.last_key = key.to_key_vec().into_key_bytes();
+            self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
             return;
         }
         self.finalize();
         assert!(self.builder.add(key, value));
-        self.last_key = key.raw_ref().to_vec();
-        self.first_key = key.raw_ref().to_vec();
-        self.key_hashes.push(farmhash::fingerprint32(key.raw_ref()));
+        self.last_key = key.to_key_vec().into_key_bytes();
+        self.first_key = key.to_key_vec().into_key_bytes();
+        self.key_hashes.push(farmhash::fingerprint32(key.key_ref()));
     }
 
     /// Get the estimated size of the SSTable.

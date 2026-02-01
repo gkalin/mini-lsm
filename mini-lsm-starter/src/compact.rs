@@ -181,16 +181,18 @@ impl LsmStorageInner {
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut compacted_ssts = Vec::new();
-        let mut prev = Vec::new();
+        let mut prev = crate::key::KeyVec::new();
         let mut build_last = false;
         while merge_iter.is_valid() {
             let (curr, value) = (merge_iter.key(), merge_iter.value());
-            if !prev.is_empty() && prev == curr.raw_ref() {
-                // skip duplicates
+            if !prev.is_empty() && prev.as_key_slice() == curr {
+                // skip duplicates (same user key AND timestamp)
                 merge_iter.next()?;
                 continue;
             }
-            if !value.is_empty() || !compact_to_bottom_level {
+            // With MVCC, keep all versions including tombstones
+            // Without MVCC, filter tombstones when compacting to bottom level
+            if !value.is_empty() || !compact_to_bottom_level || crate::key::TS_ENABLED {
                 sst_builder.add(curr, value);
                 build_last = true;
                 if sst_builder.estimated_size() >= self.options.target_sst_size {
@@ -199,7 +201,7 @@ impl LsmStorageInner {
                     build_last = false;
                 }
             }
-            prev = curr.to_key_vec().into_inner();
+            prev = curr.to_key_vec();
             merge_iter.next()?;
         }
         if build_last {

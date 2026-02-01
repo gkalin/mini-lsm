@@ -58,12 +58,14 @@ impl BlockMeta {
         for meta in block_meta {
             let offset = meta.offset as u64;
             buf.extend_from_slice(&offset.to_le_bytes());
-            let first_key_len = meta.first_key.len() as u64;
-            let last_key_len = meta.last_key.len() as u64;
+            let first_key_len = meta.first_key.key_len() as u64;
+            let last_key_len = meta.last_key.key_len() as u64;
             buf.extend_from_slice(&first_key_len.to_le_bytes());
-            buf.extend_from_slice(meta.first_key.raw_ref());
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.extend_from_slice(&meta.first_key.ts().to_le_bytes());
             buf.extend_from_slice(&last_key_len.to_le_bytes());
-            buf.extend_from_slice(meta.last_key.raw_ref());
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.extend_from_slice(&meta.last_key.ts().to_le_bytes());
         }
     }
 
@@ -77,18 +79,19 @@ impl BlockMeta {
             let offset = buf.get_u64_le() as usize;
 
             let first_key_len = buf.get_u64_le() as usize;
-
             let mut first_key = vec![0; first_key_len];
             buf.copy_to_slice(&mut first_key);
+            let first_key_ts = buf.get_u64_le();
 
             let last_key_len = buf.get_u64_le() as usize;
             let mut last_key = vec![0; last_key_len];
             buf.copy_to_slice(&mut last_key);
+            let last_key_ts = buf.get_u64_le();
 
             block_meta.push(BlockMeta {
                 offset,
-                first_key: KeyBytes::from_bytes(first_key.into()),
-                last_key: KeyBytes::from_bytes(last_key.into()),
+                first_key: KeyBytes::from_bytes_with_ts(first_key.into(), first_key_ts),
+                last_key: KeyBytes::from_bytes_with_ts(last_key.into(), last_key_ts),
             });
         }
 

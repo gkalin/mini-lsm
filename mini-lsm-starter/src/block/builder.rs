@@ -50,21 +50,45 @@ impl BlockBuilder {
     /// You may find the `bytes::BufMut` trait useful for manipulating binary data.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        let key_size = key.len();
-        let value_size = value.len();
-        let mut entry_size = 2 + key_size + 2 + value_size + 2;
+        let key_len = key.key_len();
+        let value_len = value.len();
+
         if self.full {
             return false;
         }
+
+        // Calculate actual entry size (with compression if applicable)
+        let entry_size = if self.first_key.is_empty() {
+            // First key: no compression
+            2 + 2 + key_len + 8 + 2 + value_len + 2
+        } else {
+            // Calculate compressed size
+            let overlap_len = key
+                .key_ref()
+                .iter()
+                .zip(self.first_key.key_ref().iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            2 + 2 + (key_len - overlap_len) + 8 + 2 + value_len + 2
+        };
+
         if self.block_size < self.size + entry_size {
             self.full = true;
             if self.first_key.is_empty() {
+                // First entry can still fit
                 self.first_key = key.to_key_vec();
-                self.data.push((key_size >> 8) as u8);
-                self.data.push((key_size & 0xff) as u8);
-                self.data.extend_from_slice(key.raw_ref());
-                self.data.push((value_size >> 8) as u8);
-                self.data.push((value_size & 0xff) as u8);
+                // overlap_len = 0 for first key
+                self.data.extend_from_slice(&0u16.to_be_bytes());
+                // remaining_key_len = full key length
+                self.data.extend_from_slice(&(key_len as u16).to_be_bytes());
+                // key
+                self.data.extend_from_slice(key.key_ref());
+                // timestamp
+                self.data.extend_from_slice(&key.ts().to_le_bytes());
+                // value_len
+                self.data
+                    .extend_from_slice(&(value_len as u16).to_be_bytes());
+                // value
                 self.data.extend_from_slice(value);
                 self.offsets.push(0);
                 self.size += entry_size;
@@ -72,21 +96,47 @@ impl BlockBuilder {
             }
             return false;
         }
+
         self.offsets.push(self.data.len() as u16);
+
         if self.first_key.is_empty() {
+            // First key
             self.first_key = key.to_key_vec();
-            self.data.push((key_size >> 8) as u8);
-            self.data.push((key_size & 0xff) as u8);
-            self.data.extend_from_slice(key.raw_ref());
+            // overlap_len = 0
+            self.data.extend_from_slice(&0u16.to_be_bytes());
+            // remaining_key_len = full key length
+            self.data.extend_from_slice(&(key_len as u16).to_be_bytes());
+            // key
+            self.data.extend_from_slice(key.key_ref());
+            // timestamp
+            self.data.extend_from_slice(&key.ts().to_le_bytes());
         } else {
-            let encoded_key = key.prefix_encode(self.first_key.as_key_slice());
-            self.data.extend_from_slice(encoded_key.raw_ref());
-            entry_size -= 2 + key_size;
-            entry_size += encoded_key.len();
+            // Subsequent keys - use prefix compression
+            let overlap_len = key
+                .key_ref()
+                .iter()
+                .zip(self.first_key.key_ref().iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let remaining_key = &key.key_ref()[overlap_len..];
+
+            // overlap_len
+            self.data
+                .extend_from_slice(&(overlap_len as u16).to_be_bytes());
+            // remaining_key_len
+            self.data
+                .extend_from_slice(&(remaining_key.len() as u16).to_be_bytes());
+            // remaining_key
+            self.data.extend_from_slice(remaining_key);
+            // timestamp
+            self.data.extend_from_slice(&key.ts().to_le_bytes());
         }
+
         self.size += entry_size;
-        self.data.push((value_size >> 8) as u8);
-        self.data.push((value_size & 0xff) as u8);
+        // value_len
+        self.data
+            .extend_from_slice(&(value_len as u16).to_be_bytes());
+        // value
         self.data.extend_from_slice(value);
 
         true
