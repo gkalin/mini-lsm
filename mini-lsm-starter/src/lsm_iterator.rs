@@ -39,6 +39,7 @@ pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper_bound: Bound<Bytes>,
     done: bool,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
@@ -46,16 +47,30 @@ impl LsmIterator {
         let mut iter = iter;
         while iter.is_valid() {
             if iter.value().is_empty() {
-                iter.next()?;
+                // Skip deleted keys and their old versions
+                if crate::key::TS_ENABLED {
+                    let user_key = iter.key().key_ref().to_vec();
+                    while iter.is_valid() && iter.key().key_ref() == user_key.as_slice() {
+                        iter.next()?;
+                    }
+                } else {
+                    iter.next()?;
+                }
                 continue;
             }
 
             break;
         }
+        let prev_key = if iter.is_valid() {
+            iter.key().key_ref().to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             inner: iter,
             upper_bound,
             done: false,
+            prev_key,
         })
     }
 }
@@ -79,34 +94,57 @@ impl StorageIterator for LsmIterator {
         if self.done {
             return Ok(());
         }
+
         loop {
             self.inner.next()?;
             if !self.inner.is_valid() {
                 self.done = true;
+                self.prev_key.clear();
                 break;
             }
-            if self.inner.value().is_empty() {
+
+            // Skip old versions of the same user key
+            if self.inner.key().key_ref() == self.prev_key.as_slice() {
                 continue;
             }
 
-            // show me how to print key in println!
-            // k
+            // Skip deleted keys (and their old versions)
+            if self.inner.value().is_empty() {
+                if crate::key::TS_ENABLED {
+                    let user_key = self.inner.key().key_ref().to_vec();
+                    while self.inner.is_valid() && self.inner.key().key_ref() == user_key.as_slice()
+                    {
+                        self.inner.next()?;
+                    }
+                    if !self.inner.is_valid() {
+                        self.done = true;
+                        self.prev_key.clear();
+                        break;
+                    }
+                } else {
+                    continue;
+                }
+            }
+
             match self.upper_bound.as_ref() {
                 Bound::Excluded(bound) => {
                     if self.inner.key().key_ref() >= bound.as_ref() {
                         self.done = true;
+                        self.prev_key.clear();
                         break;
                     }
                 }
                 Bound::Included(bound) => {
                     if self.inner.key().key_ref() > bound.as_ref() {
                         self.done = true;
+                        self.prev_key.clear();
                         break;
                     }
                 }
                 Bound::Unbounded => {}
             }
 
+            self.prev_key = self.inner.key().key_ref().to_vec();
             break;
         }
 

@@ -24,7 +24,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::key::KeySlice;
+use crate::key::{KeyBytes, KeySlice};
 
 pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
@@ -42,7 +42,7 @@ impl Wal {
         })
     }
 
-    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(_path: impl AsRef<Path>, _skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let file = File::options()
             .create(true)
             .read(true)
@@ -53,28 +53,68 @@ impl Wal {
         reader.read_to_end(&mut buffer)?;
         let mut pos = 0;
         while pos < buffer.len() {
+            if pos + 2 > buffer.len() {
+                break;
+            }
             let key_len = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]) as usize;
             pos += 2;
+
+            if pos + key_len + 8 + 2 > buffer.len() {
+                break;
+            }
             let key = Bytes::copy_from_slice(&buffer[pos..pos + key_len]);
             pos += key_len;
+
+            let ts = u64::from_le_bytes(buffer[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+
             let val_len = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]) as usize;
             pos += 2;
+
+            if pos + val_len + 4 > buffer.len() {
+                break;
+            }
             let val = Bytes::copy_from_slice(&buffer[pos..pos + val_len]);
             pos += val_len;
-            _skiplist.insert(key, val);
+
+            let checksum = u32::from_le_bytes([
+                buffer[pos],
+                buffer[pos + 1],
+                buffer[pos + 2],
+                buffer[pos + 3],
+            ]);
+            pos += 4;
+
+            _skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), val);
         }
         return Self::create(_path);
     }
 
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+    pub fn put(&self, _key: KeySlice, _value: &[u8]) -> Result<()> {
         let mut guard = self.file.lock();
         let wal = guard.get_mut();
-        let key_len = (_key.len() as u16).to_le_bytes();
+
+        let key_len = (_key.key_len() as u16).to_le_bytes();
         wal.write_all(&key_len)?;
-        wal.write_all(_key)?;
+        wal.write_all(_key.key_ref())?;
+
+        let ts = _key.ts().to_le_bytes();
+        wal.write_all(&ts)?;
+
         let value_len = (_value.len() as u16).to_le_bytes();
         wal.write_all(&value_len)?;
         wal.write_all(_value)?;
+
+        // Calculate checksum over key_len + key + ts + value_len + value
+        let mut checksum_data = Vec::new();
+        checksum_data.extend_from_slice(&key_len);
+        checksum_data.extend_from_slice(_key.key_ref());
+        checksum_data.extend_from_slice(&ts);
+        checksum_data.extend_from_slice(&value_len);
+        checksum_data.extend_from_slice(_value);
+        let checksum = crc32fast::hash(&checksum_data);
+
+        wal.write_all(&checksum.to_le_bytes())?;
         Ok(())
     }
 

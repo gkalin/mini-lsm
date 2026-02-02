@@ -183,27 +183,41 @@ impl LsmStorageInner {
         let mut compacted_ssts = Vec::new();
         let mut prev = crate::key::KeyVec::new();
         let mut build_last = false;
+
         while merge_iter.is_valid() {
             let (curr, value) = (merge_iter.key(), merge_iter.value());
+
             if !prev.is_empty() && prev.as_key_slice() == curr {
-                // skip duplicates (same user key AND timestamp)
+                // Skip exact duplicates (same user key AND timestamp)
                 merge_iter.next()?;
                 continue;
             }
+
             // With MVCC, keep all versions including tombstones
-            // Without MVCC, filter tombstones when compacting to bottom level
-            if !value.is_empty() || !compact_to_bottom_level || crate::key::TS_ENABLED {
-                sst_builder.add(curr, value);
-                build_last = true;
-                if sst_builder.estimated_size() >= self.options.target_sst_size {
+            sst_builder.add(curr, value);
+            build_last = true;
+
+            // Store current key's user key for comparison
+            let current_user_key = curr.key_ref().to_vec();
+            prev = curr.to_key_vec();
+            merge_iter.next()?;
+
+            // Check if we should split the SST
+            // With MVCC: only split on user key boundaries (not in middle of different versions)
+            if sst_builder.estimated_size() >= self.options.target_sst_size {
+                // Check if next key has a different user key
+                if !merge_iter.is_valid()
+                    || merge_iter.key().key_ref() != current_user_key.as_slice()
+                {
+                    // Either no more keys OR next key is a different user key → safe to split
                     self.make_new_sst(&mut compacted_ssts, sst_builder)?;
                     sst_builder = SsTableBuilder::new(self.options.block_size);
                     build_last = false;
                 }
+                // Otherwise, continue adding more versions of the same key
             }
-            prev = curr.to_key_vec();
-            merge_iter.next()?;
         }
+
         if build_last {
             self.make_new_sst(&mut compacted_ssts, sst_builder)?;
         }
