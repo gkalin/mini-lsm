@@ -433,7 +433,7 @@ impl LsmStorageInner {
             max_ts
         };
         storage.mvcc = Some(LsmMvccInner::new(max_ts));
-        storage.mvcc_ts.store(max_ts, Ordering::SeqCst);
+        storage.mvcc_ts.store(max_ts + 1, Ordering::SeqCst);
 
         let next_id = storage.next_sst_id.load(Ordering::SeqCst);
         {
@@ -600,7 +600,30 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+        if self.state.read().memtable.approximate_size() >= self.options.target_sst_size {
+            self.try_freeze_memtable(&self.state_lock.lock())?;
+        }
+        let ts = if crate::key::TS_ENABLED {
+            self.next_ts()
+        } else {
+            crate::key::TS_DEFAULT
+        };
+        let batch: Vec<_> = _batch
+            .iter()
+            .map(|record| match record {
+                WriteBatchRecord::Put(key, value) => {
+                    (KeySlice::from_slice(key.as_ref(), ts), value.as_ref())
+                }
+                WriteBatchRecord::Del(key) => {
+                    (KeySlice::from_slice(key.as_ref(), ts), [].as_slice())
+                }
+            })
+            .collect();
+        self.state.read().memtable.put_batch(&batch)?;
+        if crate::key::TS_ENABLED {
+            self.mvcc().update_commit_ts(ts);
+        }
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
