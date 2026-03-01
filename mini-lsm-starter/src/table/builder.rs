@@ -107,6 +107,10 @@ impl SsTableBuilder {
         BlockMeta::encode_block_meta(&self.meta, &mut disk_data);
         let meta_len = disk_data.len() - meta_block_offset;
 
+        // Compute and write max_ts
+        let max_ts = self.meta.iter().map(|m| m.last_key.ts()).max().unwrap_or(0);
+        disk_data.extend((max_ts).to_le_bytes());
+
         // Build and encode bloom filter
         let bloom = Bloom::build_from_key_hashes(&self.key_hashes, 20);
         let bloom_offset = disk_data.len();
@@ -128,7 +132,7 @@ impl SsTableBuilder {
             last_key: self.meta.last().unwrap().last_key.clone(),
             block_meta: self.meta,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         };
         Ok(sstable)
     }

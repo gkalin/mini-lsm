@@ -38,24 +38,59 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     upper_bound: Bound<Bytes>,
+    read_ts: u64,
     done: bool,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, upper_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        upper_bound: Bound<Bytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut iter = iter;
+        let mut done = false;
         while iter.is_valid() {
-            if iter.value().is_empty() {
+            if iter.key().ts() > read_ts {
                 iter.next()?;
                 continue;
             }
-
+            // Find first undeleted key
+            if iter.value().is_empty() {
+                let deleted_key = iter.key().key_ref().to_vec();
+                while iter.is_valid() && iter.key().key_ref() == deleted_key.as_slice() {
+                    iter.next()?;
+                }
+                continue;
+            }
+            // Check upper bound
+            match upper_bound.as_ref() {
+                Bound::Excluded(bound) => {
+                    if iter.key().key_ref() >= bound.as_ref() {
+                        done = true;
+                    }
+                }
+                Bound::Included(bound) => {
+                    if iter.key().key_ref() > bound.as_ref() {
+                        done = true;
+                    }
+                }
+                Bound::Unbounded => {}
+            }
             break;
         }
+        let prev_key = if iter.is_valid() && !done {
+            iter.key().key_ref().to_vec()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             inner: iter,
             upper_bound,
-            done: false,
+            done,
+            prev_key,
+            read_ts,
         })
     }
 }
@@ -79,34 +114,54 @@ impl StorageIterator for LsmIterator {
         if self.done {
             return Ok(());
         }
+
+        self.inner.next()?;
         loop {
-            self.inner.next()?;
             if !self.inner.is_valid() {
                 self.done = true;
+                self.prev_key.clear();
                 break;
             }
-            if self.inner.value().is_empty() {
+            if self.inner.key().ts() > self.read_ts {
+                self.inner.next()?;
                 continue;
             }
 
-            // show me how to print key in println!
-            // k
+            // Skip old versions of the same user key
+            if self.inner.key().key_ref() == self.prev_key.as_slice() {
+                self.inner.next()?;
+                continue;
+            }
+
+            // Skip deleted keys (and their old versions)
+            if self.inner.value().is_empty() {
+                let deleted_key = self.inner.key().key_ref().to_vec();
+                while self.inner.is_valid() && self.inner.key().key_ref() == deleted_key.as_slice()
+                {
+                    self.inner.next()?;
+                }
+                continue;
+            }
+
             match self.upper_bound.as_ref() {
                 Bound::Excluded(bound) => {
                     if self.inner.key().key_ref() >= bound.as_ref() {
                         self.done = true;
+                        self.prev_key.clear();
                         break;
                     }
                 }
                 Bound::Included(bound) => {
                     if self.inner.key().key_ref() > bound.as_ref() {
                         self.done = true;
+                        self.prev_key.clear();
                         break;
                     }
                 }
                 Bound::Unbounded => {}
             }
 
+            self.prev_key = self.inner.key().key_ref().to_vec();
             break;
         }
 

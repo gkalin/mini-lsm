@@ -177,9 +177,18 @@ impl SsTable {
                 .expect("failed to convert bloom offset"),
         );
 
-        // Read block metadata
-        let block_meta_file = file.read(block_meta_offset, bloom_offset - block_meta_offset)?;
-        let block_meta = BlockMeta::decode_block_meta(block_meta_file.as_slice());
+        // Read block metadata (everything from block_meta_offset up to max_ts + bloom)
+        let raw_meta = file.read(block_meta_offset, bloom_offset - block_meta_offset - 8)?;
+        let block_meta = BlockMeta::decode_block_meta(raw_meta.as_slice());
+
+        // Read max_ts (8 bytes right before bloom filter)
+        let max_ts_bytes = file.read(bloom_offset - 8, 8)?;
+        let max_ts = u64::from_le_bytes(
+            max_ts_bytes
+                .as_slice()
+                .try_into()
+                .expect("failed to convert max_ts"),
+        );
 
         // Read bloom filter
         let bloom_data = file.read(bloom_offset, file.size() - 16 - bloom_offset)?;
@@ -198,7 +207,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 
