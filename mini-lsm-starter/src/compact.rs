@@ -181,40 +181,51 @@ impl LsmStorageInner {
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut sst_builder = SsTableBuilder::new(self.options.block_size);
         let mut compacted_ssts = Vec::new();
-        let mut prev = crate::key::KeyVec::new();
         let mut build_last = false;
+        let mut prev_key = Vec::<u8>::new();
+        let mut had_below_watermark = false;
+        let watermark = self.mvcc().watermark();
 
         while merge_iter.is_valid() {
-            let (curr, value) = (merge_iter.key(), merge_iter.value());
+            let curr = merge_iter.key();
+            let value = merge_iter.value();
 
-            if !prev.is_empty() && prev.as_key_slice() == curr {
-                // Skip exact duplicates (same user key AND timestamp)
-                merge_iter.next()?;
-                continue;
+            if curr.key_ref() != prev_key.as_slice() {
+                prev_key = curr.key_ref().to_vec();
+                had_below_watermark = false;
             }
 
-            // With MVCC, keep all versions including tombstones
+            if curr.ts() <= watermark {
+                if had_below_watermark {
+                    // Already kept the latest version at/below watermark, skip older versions
+                    merge_iter.next()?;
+                    continue;
+                }
+                had_below_watermark = true;
+                // This is the latest version at/below watermark
+                if compact_to_bottom_level && value.is_empty() {
+                    // Tombstone at bottom level can be removed
+                    merge_iter.next()?;
+                    continue;
+                }
+            }
+
+            // Keep this entry
             sst_builder.add(curr, value);
             build_last = true;
 
-            // Store current key's user key for comparison
             let current_user_key = curr.key_ref().to_vec();
-            prev = curr.to_key_vec();
             merge_iter.next()?;
 
-            // Check if we should split the SST
-            // With MVCC: only split on user key boundaries (not in middle of different versions)
+            // Split SST only on user key boundaries
             if sst_builder.estimated_size() >= self.options.target_sst_size {
-                // Check if next key has a different user key
                 if !merge_iter.is_valid()
                     || merge_iter.key().key_ref() != current_user_key.as_slice()
                 {
-                    // Either no more keys OR next key is a different user key → safe to split
                     self.make_new_sst(&mut compacted_ssts, sst_builder)?;
                     sst_builder = SsTableBuilder::new(self.options.block_size);
                     build_last = false;
                 }
-                // Otherwise, continue adding more versions of the same key
             }
         }
 

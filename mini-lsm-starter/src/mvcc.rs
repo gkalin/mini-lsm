@@ -77,6 +77,7 @@ impl LsmMvccInner {
             committed: Arc::new(AtomicBool::new(false)),
             key_hashes: Some(Mutex::new((HashSet::<u32>::new(), HashSet::<u32>::new()))),
         };
+        self.ts.lock().1.add_reader(tx.read_ts);
         Arc::new(tx)
     }
 }
