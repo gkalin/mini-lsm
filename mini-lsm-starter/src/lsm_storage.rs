@@ -43,6 +43,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 use crate::wal::Wal;
 
@@ -226,7 +227,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -241,6 +242,9 @@ impl MiniLsm {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.inner.get(key)
     }
+    pub fn get_with_ts(&self, key: &[u8], ts: u64) -> Result<Option<Bytes>> {
+        self.inner.get_with_ts(key, ts)
+    }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner.put(key, value)
@@ -254,11 +258,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -278,7 +278,7 @@ impl MiniLsm {
         self.inner.force_full_compaction()
     }
 }
-pub(crate) fn convert_bound<T: AsRef<[u8]>>(bound: Bound<T>) -> Bound<Bytes> {
+pub fn convert_bound<T: AsRef<[u8]>>(bound: Bound<T>) -> Bound<Bytes> {
     match bound {
         Bound::Included(b) => Bound::Included(Bytes::copy_from_slice(b.as_ref())),
         Bound::Excluded(b) => Bound::Excluded(Bytes::copy_from_slice(b.as_ref())),
@@ -336,7 +336,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest: Some(manifest),
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
         let mut flushed_memtable_ids = std::collections::HashSet::new();
@@ -414,6 +414,27 @@ impl LsmStorageInner {
                 }
             }
         }
+        // Recover max committed timestamp from SSTs and (if WAL enabled) memtables
+        let max_ts = {
+            let state = storage.state.read();
+            let mut max_ts = 0u64;
+            for sst in state.sstables.values() {
+                max_ts = max_ts.max(sst.max_ts());
+            }
+            if storage.options.enable_wal {
+                for memtable in std::iter::once(&state.memtable).chain(state.imm_memtables.iter()) {
+                    let mut iter = memtable.scan(Bound::Unbounded, Bound::Unbounded);
+                    while iter.is_valid() {
+                        max_ts = max_ts.max(iter.key().ts());
+                        iter.next()?;
+                    }
+                }
+            }
+            max_ts
+        };
+        storage.mvcc = Some(LsmMvccInner::new(max_ts));
+        storage.mvcc_ts.store(max_ts, Ordering::SeqCst);
+
         let next_id = storage.next_sst_id.load(Ordering::SeqCst);
         {
             let mut state = storage.state.write();
@@ -449,8 +470,7 @@ impl LsmStorageInner {
         begin.key_ref() <= key && key <= end.key_ref()
     }
 
-    /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get_with_ts(&self, _key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let snapshot = {
             let lock_guard = self.state.read();
             Arc::clone(&lock_guard)
@@ -461,6 +481,12 @@ impl LsmStorageInner {
             Bound::Included(KeySlice::from_slice(_key, crate::key::TS_RANGE_BEGIN)),
             Bound::Included(KeySlice::from_slice(_key, crate::key::TS_RANGE_END)),
         );
+        while memtable_iter.is_valid()
+            && memtable_iter.key().key_ref() == _key
+            && memtable_iter.key().ts() > read_ts
+        {
+            memtable_iter.next()?;
+        }
         if memtable_iter.is_valid() && memtable_iter.key().key_ref() == _key {
             if memtable_iter.value().is_empty() {
                 return Ok(None);
@@ -474,6 +500,12 @@ impl LsmStorageInner {
                 Bound::Included(KeySlice::from_slice(_key, crate::key::TS_RANGE_BEGIN)),
                 Bound::Included(KeySlice::from_slice(_key, crate::key::TS_RANGE_END)),
             );
+            while imm_iter.is_valid()
+                && imm_iter.key().key_ref() == _key
+                && imm_iter.key().ts() > read_ts
+            {
+                imm_iter.next()?;
+            }
             if imm_iter.is_valid() && imm_iter.key().key_ref() == _key {
                 if imm_iter.value().is_empty() {
                     return Ok(None);
@@ -486,7 +518,6 @@ impl LsmStorageInner {
         let mut sstable_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for id in snapshot.l0_sstables.iter() {
             let sstable = snapshot.sstables[id].clone();
-            // Bloom filter check
             if sstable.bloom.as_ref().map_or(true, |bloom| {
                 bloom.may_contain(farmhash::fingerprint32(_key))
             }) {
@@ -505,10 +536,12 @@ impl LsmStorageInner {
                 }
             }
         }
-        let iters = MergeIterator::create(sstable_iters);
+        let mut iters = MergeIterator::create(sstable_iters);
+        while iters.is_valid() && iters.key().key_ref() == _key && iters.key().ts() > read_ts {
+            iters.next()?;
+        }
         if iters.is_valid() && iters.key().key_ref() == _key {
             if iters.value().is_empty() {
-                // Found a tombstone in L0
                 return Ok(None);
             }
             return Ok(Some(Bytes::copy_from_slice(iters.value())));
@@ -520,7 +553,6 @@ impl LsmStorageInner {
                 .iter()
                 .filter_map(|idx| {
                     let sstable = snapshot.sstables.get(idx)?;
-                    // Bloom filter check
                     if sstable.bloom.as_ref().map_or(true, |bloom| {
                         bloom.may_contain(farmhash::fingerprint32(_key))
                     }) {
@@ -539,13 +571,18 @@ impl LsmStorageInner {
                 })
                 .collect();
             if !sstables.is_empty() {
-                let concat_iterator = SstConcatIterator::create_and_seek_to_key(
+                let mut concat_iterator = SstConcatIterator::create_and_seek_to_key(
                     sstables,
                     KeySlice::from_slice(_key, crate::key::TS_RANGE_BEGIN),
                 )?;
+                while concat_iterator.is_valid()
+                    && concat_iterator.key().key_ref() == _key
+                    && concat_iterator.key().ts() > read_ts
+                {
+                    concat_iterator.next()?;
+                }
                 if concat_iterator.is_valid() && concat_iterator.key().key_ref() == _key {
                     if concat_iterator.value().is_empty() {
-                        // Found a tombstone
                         return Ok(None);
                     }
                     return Ok(Some(Bytes::copy_from_slice(concat_iterator.value())));
@@ -554,6 +591,11 @@ impl LsmStorageInner {
         }
 
         Ok(None)
+    }
+
+    /// Get a key from the storage.
+    pub fn get(self: &Arc<Self>, _key: &[u8]) -> Result<Option<Bytes>> {
+        self.mvcc().new_txn(self.clone(), false).get(_key)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -574,7 +616,11 @@ impl LsmStorageInner {
         self.state
             .read()
             .memtable
-            .put(KeySlice::from_slice(_key, ts), _value)
+            .put(KeySlice::from_slice(_key, ts), _value)?;
+        if crate::key::TS_ENABLED {
+            self.mvcc().update_commit_ts(ts);
+        }
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
@@ -590,7 +636,11 @@ impl LsmStorageInner {
         self.state
             .read()
             .memtable
-            .put(KeySlice::from_slice(_key, ts), &[])
+            .put(KeySlice::from_slice(_key, ts), &[])?;
+        if crate::key::TS_ENABLED {
+            self.mvcc().update_commit_ts(ts);
+        }
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -705,18 +755,16 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
+        Ok(self.mvcc().new_txn(self.clone(), false))
     }
 
-    /// Create an iterator over a range of keys.
-    pub fn scan(
+    pub fn scan_with_ts(
         &self,
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
-        // Assume MemtableIterator is the concrete iterator type
         let snapshot = {
             let lock_guard = self.state.read();
             Arc::clone(&lock_guard)
@@ -769,7 +817,6 @@ impl LsmStorageInner {
                             sstable,
                             KeySlice::from_slice(key, crate::key::TS_RANGE_BEGIN),
                         )?;
-                        // Skip all versions of the excluded key
                         while iter.is_valid() && iter.key().key_ref() == key {
                             iter.next()?;
                         }
@@ -812,7 +859,6 @@ impl LsmStorageInner {
                             sstables,
                             KeySlice::from_slice(key, crate::key::TS_RANGE_BEGIN),
                         )?;
-                        // Skip all versions of the excluded key
                         while iter.is_valid() && iter.key().key_ref() == key {
                             iter.next()?;
                         }
@@ -830,7 +876,18 @@ impl LsmStorageInner {
                 merge_concat_iters,
             )?,
             convert_bound(_upper),
+            read_ts,
         )?))
+    }
+
+    /// Create an iterator over a range of keys.
+    pub fn scan(
+        self: &Arc<Self>,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+    ) -> Result<TxnIterator> {
+        let txn = self.mvcc().new_txn(self.clone(), false);
+        txn.scan(_lower, _upper)
     }
 }
 
