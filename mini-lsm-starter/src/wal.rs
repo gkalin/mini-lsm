@@ -53,74 +53,82 @@ impl Wal {
         reader.read_to_end(&mut buffer)?;
         let mut pos = 0;
         while pos < buffer.len() {
-            if pos + 2 > buffer.len() {
+            // Read header: batch_size (u32)
+            if pos + 4 > buffer.len() {
                 break;
             }
-            let key_len = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]) as usize;
-            pos += 2;
-
-            if pos + key_len + 8 + 2 > buffer.len() {
-                break;
-            }
-            let key = Bytes::copy_from_slice(&buffer[pos..pos + key_len]);
-            pos += key_len;
-
-            let ts = u64::from_le_bytes(buffer[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-
-            let val_len = u16::from_le_bytes([buffer[pos], buffer[pos + 1]]) as usize;
-            pos += 2;
-
-            if pos + val_len + 4 > buffer.len() {
-                break;
-            }
-            let val = Bytes::copy_from_slice(&buffer[pos..pos + val_len]);
-            pos += val_len;
-
-            let checksum = u32::from_le_bytes([
-                buffer[pos],
-                buffer[pos + 1],
-                buffer[pos + 2],
-                buffer[pos + 3],
-            ]);
+            let batch_size = u32::from_le_bytes(buffer[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
 
-            _skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), val);
+            if pos + batch_size + 4 > buffer.len() {
+                break;
+            }
+
+            let body = &buffer[pos..pos + batch_size];
+            let checksum = u32::from_le_bytes(
+                buffer[pos + batch_size..pos + batch_size + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+
+            if crc32fast::hash(body) != checksum {
+                break;
+            }
+
+            // Parse body
+            let mut body_pos = 0;
+            while body_pos < body.len() {
+                let key_len =
+                    u16::from_le_bytes(body[body_pos..body_pos + 2].try_into().unwrap()) as usize;
+                body_pos += 2;
+
+                let key = Bytes::copy_from_slice(&body[body_pos..body_pos + key_len]);
+                body_pos += key_len;
+
+                let ts = u64::from_le_bytes(body[body_pos..body_pos + 8].try_into().unwrap());
+                body_pos += 8;
+
+                let val_len =
+                    u16::from_le_bytes(body[body_pos..body_pos + 2].try_into().unwrap()) as usize;
+                body_pos += 2;
+
+                let val = Bytes::copy_from_slice(&body[body_pos..body_pos + val_len]);
+                body_pos += val_len;
+
+                _skiplist.insert(KeyBytes::from_bytes_with_ts(key, ts), val);
+            }
+
+            pos += batch_size + 4;
         }
-        return Self::create(_path);
+        Self::create(_path)
     }
 
     pub fn put(&self, _key: KeySlice, _value: &[u8]) -> Result<()> {
+        self.put_batch(&[(_key, _value)])
+    }
+
+    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
         let mut guard = self.file.lock();
         let wal = guard.get_mut();
 
-        let key_len = (_key.key_len() as u16).to_le_bytes();
-        wal.write_all(&key_len)?;
-        wal.write_all(_key.key_ref())?;
+        // Build body
+        let mut body = Vec::new();
+        for (key, value) in _data {
+            body.extend_from_slice(&(key.key_len() as u16).to_le_bytes());
+            body.extend_from_slice(key.key_ref());
+            body.extend_from_slice(&key.ts().to_le_bytes());
+            body.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            body.extend_from_slice(value);
+        }
 
-        let ts = _key.ts().to_le_bytes();
-        wal.write_all(&ts)?;
-
-        let value_len = (_value.len() as u16).to_le_bytes();
-        wal.write_all(&value_len)?;
-        wal.write_all(_value)?;
-
-        // Calculate checksum over key_len + key + ts + value_len + value
-        let mut checksum_data = Vec::new();
-        checksum_data.extend_from_slice(&key_len);
-        checksum_data.extend_from_slice(_key.key_ref());
-        checksum_data.extend_from_slice(&ts);
-        checksum_data.extend_from_slice(&value_len);
-        checksum_data.extend_from_slice(_value);
-        let checksum = crc32fast::hash(&checksum_data);
-
+        // Write header (batch_size = body length)
+        wal.write_all(&(body.len() as u32).to_le_bytes())?;
+        // Write body
+        wal.write_all(&body)?;
+        // Write footer (checksum of body)
+        let checksum = crc32fast::hash(&body);
         wal.write_all(&checksum.to_le_bytes())?;
         Ok(())
-    }
-
-    /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
     }
 
     pub fn sync(&self) -> Result<()> {
